@@ -504,15 +504,10 @@ def cmd_check(args):
 # `mux-subs` / `mux-audio` subcommands
 # --------------------------------------------------------------------------
 
-# mkvmerge track type -> the --XXX-tracks flag used to select tracks,
-# and the suffix used for output filenames.
+# mkvmerge track type -> the --XXX-tracks flag used to select tracks.
 TRACK_TYPE_FLAG = {
     "subtitles": "--subtitle-tracks",
     "audio": "--audio-tracks",
-}
-TRACK_TYPE_SUFFIX = {
-    "subtitles": "with_subs",
-    "audio": "with_audio",
 }
 
 
@@ -725,10 +720,12 @@ def cmd_mux_generic(args, track_types):
         no_sync = getattr(args, "no_sync", False)
         sync_ms = 0.0 if no_sync else sign * start_offset_ms
 
-        suffix = "_".join(TRACK_TYPE_SUFFIX[t] for t in track_types) \
-            if len(track_types) > 1 else TRACK_TYPE_SUFFIX[track_types[0]]
-        out_name = target.stem + "." + suffix + target.suffix
-        output = args.output_dir / out_name
+        output = args.output_dir / target.name
+        if output.resolve() == target.resolve():
+            print(f"{c('ERROR', 'red')}: output {output} would overwrite the destination file "
+                  f"- choose a different --output-dir", file=sys.stderr)
+            failed += 1
+            continue
 
         print(f"{c(source.name, 'cyan')} -> {c(target.name, 'cyan')}  (sync {sync_ms:+.1f}ms"
               f"{' - forced to 0 via --no-sync' if no_sync and (sign * start_offset_ms) != 0 else ''})")
