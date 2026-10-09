@@ -527,12 +527,15 @@ def identify_tracks(path: Path, track_type: str):
 
 def mux_pair(source: Path, target: Path, output: Path, offset_ms: float,
              track_types, track_ids_by_type=None, track_name_by_type=None,
-             dry_run=False):
+             dry_run=False, exclude_dest_tracks=False):
     """track_types: list of 'subtitles' and/or 'audio'.
     track_ids_by_type: optional dict {track_type: [ids]} to filter each type.
     track_name_by_type: optional dict {track_type: substring} - only tracks
     whose track name/title contains this substring (case-insensitive) are
-    copied for that type."""
+    copied for that type.
+    exclude_dest_tracks: if True, drop target's own track(s) of the type(s)
+    being copied (so the copied tracks replace rather than sit alongside
+    whatever the target already had of that type)."""
     track_ids_by_type = track_ids_by_type or {}
     track_name_by_type = track_name_by_type or {}
 
@@ -598,12 +601,23 @@ def mux_pair(source: Path, target: Path, output: Path, offset_ms: float,
     # (e.g. sequential 1, 2, 3...) can't collide with the target's.
     flag_args.append("--regenerate-track-uids")
 
+    # If replacing rather than adding, drop the target's own track(s) of
+    # the type(s) being copied. These options must appear right before
+    # the target filename to apply to it (unlike flag_args above, which
+    # apply to `source` since they precede it instead).
+    target_flag_args = []
+    if exclude_dest_tracks:
+        for track_type in track_types:
+            target_flag_args.append(f"--no-{track_type}")
+        for t in track_types:
+            print(f"    Dropping {target.name}'s own {t} track(s)")
+
     # --stop-after-video-ends truncates all appended/added tracks (the
     # audio and/or subtitle tracks we're pulling in from `source`) once the
     # video track from `target` ends, so a longer source file doesn't
     # leave trailing audio/subs hanging past the end of the video.
-    cmd = ["mkvmerge", "-o", str(output), "--stop-after-video-ends",
-           str(target)] + flag_args
+    cmd = ["mkvmerge", "-o", str(output), "--stop-after-video-ends"] + \
+          target_flag_args + [str(target)] + flag_args
     for i in sync_ids:
         cmd += ["--sync", f"{i}:{round(offset_ms)}"]
     cmd += [str(source)]
@@ -708,22 +722,24 @@ def cmd_mux_generic(args, track_types):
         # offset_seconds from `check` is: how much file2 is delayed
         # relative to file1 (positive = file2 starts later).
         start_offset_ms = float(row["start_offset_ms"])
-        sync_ms = sign * start_offset_ms
+        no_sync = getattr(args, "no_sync", False)
+        sync_ms = 0.0 if no_sync else sign * start_offset_ms
 
         suffix = "_".join(TRACK_TYPE_SUFFIX[t] for t in track_types) \
             if len(track_types) > 1 else TRACK_TYPE_SUFFIX[track_types[0]]
-        #out_name = target.stem + "." + suffix + target.suffix
-        out_name = target.stem + target.suffix
+        out_name = target.stem + "." + suffix + target.suffix
         output = args.output_dir / out_name
 
-        print(f"{c(source.name, 'cyan')} -> {c(target.name, 'cyan')}  (sync {sync_ms:+.1f}ms)")
+        print(f"{c(source.name, 'cyan')} -> {c(target.name, 'cyan')}  (sync {sync_ms:+.1f}ms"
+              f"{' - forced to 0 via --no-sync' if no_sync and (sign * start_offset_ms) != 0 else ''})")
         if not source.exists() or not target.exists():
             print(f"    {c('ERROR', 'red')}: missing file(s) on disk, skipping.", file=sys.stderr)
             failed += 1
             continue
 
         ok = mux_pair(source, target, output, sync_ms, track_types,
-                      track_ids_by_type, track_name_by_type, dry_run)
+                      track_ids_by_type, track_name_by_type, dry_run,
+                      getattr(args, "exclude_dest_tracks", False))
         if ok:
             processed += 1
         else:
@@ -792,6 +808,10 @@ def main():
                         help="Also process DRIFT_DETECTED pairs (risky: uses only the start offset)")
     mux_p.add_argument("--dry-run", action="store_true",
                         help="Print what would be muxed without writing any output files")
+    mux_p.add_argument("--exclude-dest-tracks", action="store_true",
+                        help="Drop the destination file's own subtitle track(s) so the copied ones replace them instead of sitting alongside them")
+    mux_p.add_argument("--no-sync", action="store_true",
+                        help="Copy tracks with zero delay, ignoring the offset measured by `check`")
     mux_p.set_defaults(func=cmd_mux)
 
     mux_audio_p = sub.add_parser("mux-audio", help="Copy audio track(s) using a report from `check`")
@@ -809,6 +829,10 @@ def main():
                               help="Also process DRIFT_DETECTED pairs (risky: uses only the start offset)")
     mux_audio_p.add_argument("--dry-run", action="store_true",
                               help="Print what would be muxed without writing any output files")
+    mux_audio_p.add_argument("--exclude-dest-tracks", action="store_true",
+                              help="Drop the destination file's own audio track(s) so the copied ones replace them instead of sitting alongside them")
+    mux_audio_p.add_argument("--no-sync", action="store_true",
+                              help="Copy tracks with zero delay, ignoring the offset measured by `check`")
     mux_audio_p.set_defaults(func=cmd_mux_audio)
 
     mux_both_p = sub.add_parser("mux-both", help="Copy both subtitle and audio track(s) using a report from `check`")
@@ -830,6 +854,10 @@ def main():
                              help="Also process DRIFT_DETECTED pairs (risky: uses only the start offset)")
     mux_both_p.add_argument("--dry-run", action="store_true",
                              help="Print what would be muxed without writing any output files")
+    mux_both_p.add_argument("--exclude-dest-tracks", action="store_true",
+                             help="Drop the destination file's own subtitle+audio track(s) so the copied ones replace them instead of sitting alongside them")
+    mux_both_p.add_argument("--no-sync", action="store_true",
+                             help="Copy tracks with zero delay, ignoring the offset measured by `check`")
     mux_both_p.set_defaults(func=cmd_mux_both)
 
     args = ap.parse_args()
