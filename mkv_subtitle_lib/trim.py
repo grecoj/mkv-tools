@@ -16,6 +16,8 @@ from .common import (
     TIMESTAMP_RE,
     TRACKS_META_FILENAME,
     TRIMMED_DIRNAME,
+    add_rebuild_args,
+    add_stage,
     c,
     check_ffprobe,
     check_tools,
@@ -208,6 +210,17 @@ def get_video_duration_seconds(mkv_path: Path) -> Optional[float]:
 
 
 def cmd_trim(args: argparse.Namespace) -> None:
+    r"""Cut subtitle entries that run past the video's duration and rebuild the mkv files.
+
+    An alternative to plan-replace/merge-replace for a different problem: a subtitle track
+    that runs longer than the video itself. Reads each extracted subtitle file, drops any
+    entries that start after the video ends and truncates any entry that starts before the
+    end but runs past it, then rebuilds the mkv the same way 'merge-replace' does. Requires
+    'extract' to have been run first; does not require 'plan-replace'. Needs ffprobe (part of
+    FFmpeg, https://ffmpeg.org/) on PATH to determine the video's true duration -- mkvmerge's
+    own container-duration figure isn't usable here since it reflects the longest track,
+    which is exactly the oversized subtitle track this stage is trying to fix.
+    """
     check_tools()
     check_ffprobe()
     input_dir = Path(args.input_dir).resolve()
@@ -292,3 +305,13 @@ def cmd_trim(args: argparse.Namespace) -> None:
         return
 
     rebuild_all_mkvs(work_dir, input_dir, output_dir, edited_paths, args.in_place, args.dry_run)
+
+
+def register(sub) -> None:
+    p = add_stage(sub, "trim",
+                  "Cut subtitle entries that run past the video's duration and rebuild the mkv files.",
+                  cmd_trim)
+    add_rebuild_args(p, "trimmed/rebuilt")
+    p.add_argument("--margin", type=float, default=DEFAULT_TRIM_MARGIN_SECONDS,
+                   help="Seconds of buffer added to the video duration before trimming, so a "
+                        f"caption ending right at the last frame isn't cut (default: {DEFAULT_TRIM_MARGIN_SECONDS}).")

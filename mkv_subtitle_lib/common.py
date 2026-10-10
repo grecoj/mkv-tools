@@ -1,9 +1,10 @@
 """Shared infrastructure: constants, color output, mkvtoolnix helpers, ASS/SRT parsing primitives,
-CLI argument helpers, and the mkvmerge rebuild step used by every stage that writes an mkv.
+CLI argument helpers (parse_* types and the add_* flag helpers each stage's register() uses), and the mkvmerge rebuild step used by every stage that writes an mkv.
 """
 
 from __future__ import annotations
 import argparse
+import inspect
 import json
 import os
 import re
@@ -11,7 +12,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 
 # Formats we can actually search/edit as text.
@@ -518,3 +519,64 @@ def track_matches_filter(track_id: int, track_name: str, id_filter: Optional[Lis
         if not any(n.lower() in name_lower for n in name_filter):
             return False
     return True
+
+
+# --------------------------------------------------------------------------
+# CLI flag helpers. Each stage module defines register(sub) and builds its own
+# subparser from these, so the flags every stage shares (and their defaults and
+# wording) live in one place.
+# --------------------------------------------------------------------------
+
+
+def add_stage(sub, name: str, help: str, func: Callable[[argparse.Namespace], None]) -> argparse.ArgumentParser:
+    """Create a stage's subparser. Its --help description is `func`'s docstring."""
+    p = sub.add_parser(
+        name,
+        help=help,
+        description=inspect.cleandoc(func.__doc__ or ""),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.set_defaults(func=func)
+    return p
+
+
+def add_input_dir(p: argparse.ArgumentParser, what: str = "the original .mkv files") -> None:
+    p.add_argument("-i", "--input-dir", default=DEFAULT_INPUT_DIR,
+                   help=f"Folder containing {what} (default: {DEFAULT_INPUT_DIR}).")
+
+
+def add_work_dir(p: argparse.ArgumentParser, used_by: Optional[str] = "'extract'") -> None:
+    p.add_argument("-w", "--work-dir", default=DEFAULT_WORK_DIR,
+                   help="Scratch/work directory" + (f" used by {used_by}" if used_by else "")
+                        + f" (default: ./{DEFAULT_WORK_DIR}).")
+
+
+def add_rebuild_args(p: argparse.ArgumentParser, what: str, used_by: str = "'extract'") -> None:
+    """-i, -w, -o, --in-place and --dry-run: the flags shared by every stage that rebuilds mkvs
+    from edited subtitle files. `what` completes "Show what would be ..." in the --dry-run help."""
+    add_input_dir(p)
+    add_work_dir(p, used_by)
+    p.add_argument("-o", "--output-dir", default=DEFAULT_OUTPUT_DIR,
+                   help=f"Where rebuilt .mkv files are written (default: ./{DEFAULT_OUTPUT_DIR}).")
+    p.add_argument("--in-place", action="store_true",
+                   help="After building, move the rebuilt files over the originals in "
+                        "--input-dir (originals are backed up as *.mkv.bak).")
+    p.add_argument("--dry-run", action="store_true",
+                   help=f"Show what would be {what} without touching any .mkv files. Still writes "
+                        "the edited subtitle files to the work directory for inspection.")
+
+
+def add_track_filters(p: argparse.ArgumentParser, verb: str) -> None:
+    """--track-id / --track-name, matched by track_matches_filter()."""
+    p.add_argument("--track-id", default=None, type=parse_int_list, metavar="ID[,ID...]",
+                   help=f"Only {verb} subtitle track(s) with this ID (as extracted, e.g. '2' or '2,3'). "
+                        "Default: all editable ASS/SSA tracks.")
+    p.add_argument("--track-name", default=None, type=parse_str_list, metavar="NAME[,NAME...]",
+                   help=f"Only {verb} subtitle track(s) whose track name contains this text "
+                        "(case-insensitive, e.g. 'Signs' or 'Signs,Songs'). Combined with --track-id "
+                        "(if both given) as AND, not OR. Default: all editable ASS/SSA tracks.")
+
+
+def add_fonts_dir(p: argparse.ArgumentParser, purpose: str) -> None:
+    p.add_argument("--fonts-dir", default=None, metavar="DIR",
+                   help=f"{purpose} Default: a '{DEFAULT_FONTS_DIRNAME}' folder next to this script.")

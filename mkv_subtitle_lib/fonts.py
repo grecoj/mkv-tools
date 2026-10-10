@@ -19,7 +19,19 @@ import tempfile
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from fontTools.ttLib import TTCollection, TTFont
-from .common import DEFAULT_FONTS_DIRNAME, C, c, check_tools, find_mkvs, probe
+from .common import (
+    C,
+    DEFAULT_FONTS_DIRNAME,
+    FONT_MIME_TYPES,
+    add_fonts_dir,
+    add_input_dir,
+    add_stage,
+    c,
+    check_tools,
+    default_fonts_dir,
+    find_mkvs,
+    probe,
+)
 
 SSA_CODECS = {"S_TEXT/ASS": ".ass", "S_TEXT/SSA": ".ssa"}
 FONT_EXTS = {".ttf", ".otf", ".ttc", ".otc", ".woff", ".woff2"}
@@ -61,11 +73,6 @@ def font_names_from_file(path: Path) -> Set[str]:
                 names.add(norm(rec.toUnicode(errors="replace")))
     names.discard("")
     return names
-
-
-def default_fonts_dir() -> Path:
-    """The fonts library next to the launcher (sibling of the mkv_subtitle_lib folder)."""
-    return Path(__file__).resolve().parent.parent / DEFAULT_FONTS_DIRNAME
 
 
 INDEX_NAME = ".font_index.json"
@@ -243,6 +250,16 @@ def chars_by_font(path: Path) -> Dict[str, Set[str]]:
 
 
 def cmd_check_fonts(args: argparse.Namespace) -> None:
+    r"""Check each mkv's ASS/SSA subtitle tracks for fonts that are neither attached nor installed.
+
+    Read-only. For every ASS/SSA subtitle track in each mkv, finds the fonts actually used
+    (styles referenced by dialogue lines plus inline \fn overrides) and reports any that are
+    not attached to the mkv. Fonts available in the fonts folder (default: the
+    'mkv_subtitle_fonts' folder next to this script, or --fonts-dir), or installed on this
+    machine (with --check-system), are listed separately from truly missing ones. Does not
+    require 'extract' and does not modify any files. Requires fontTools
+    (pip install fonttools).
+    """
     check_tools()
     input_dir = Path(args.input_dir).resolve()
     mkvs = find_mkvs(input_dir)
@@ -354,7 +371,14 @@ def cmd_check_fonts(args: argparse.Namespace) -> None:
 
 
 def cmd_dump_fonts(args: argparse.Namespace) -> None:
-    """Extract every unique font attachment from each mkv into one folder."""
+    r"""Extract every unique attached font from a folder of mkv files into one folder.
+
+    Extracts every font attached to the mkvs in a folder into a single folder, keeping only
+    one copy of each unique file (compared by content, so the same font attached to many
+    episodes is written once). Re-runs skip fonts already in the output folder. If two
+    different files share a filename (e.g. different versions), the later one gets a short
+    hash suffix. Read-only on the mkvs; does not require 'extract'.
+    """
     check_tools()
     input_dir = Path(args.input_dir).resolve()
     if args.output_dir:
@@ -626,7 +650,24 @@ def collect_mkv_fonts(mkv: Path, info: dict):
 
 
 def cmd_add_fonts(args: argparse.Namespace) -> None:
-    """Attach fonts from the fonts folder that the subs use but the mkv doesn't carry."""
+    r"""Attach fonts from the fonts folder to mkvs whose subs use fonts the mkv doesn't carry.
+
+    For each mkv, finds fonts used by its ASS/SSA tracks that aren't attached, looks them up
+    (by internal font name) in the fonts folder (default: 'mkv_subtitle_fonts' next to this
+    script, or --fonts-dir), and attaches matching files with mkvpropedit (part of
+    MKVToolNix). By default this edits the mkv files IN PLACE (fast, no remux); use -o to
+    write edited copies to another folder instead, or --dry-run to only show what would be
+    attached.
+
+    For each font it attaches one file per bold/italic variant of the family (Regular,
+    Bold, ...). Where the folder holds several candidate files for a variant (.ttf vs .otf,
+    filename-case variants, hash-suffixed versions), they are checked against the characters
+    the subs actually render with that font: candidates missing any of those glyphs are
+    excluded, and if the remaining ones differ in character widths the pick is flagged for
+    review. Ties go to .ttf, then an unsuffixed name, then the largest file. Fonts not found
+    in the folder are listed as still missing. Does not require 'extract'. Requires fontTools
+    (pip install fonttools).
+    """
     check_tools()
     if not shutil.which("mkvpropedit"):
         print(c("mkvpropedit not found (it ships with MKVToolNix).", C.YELLOW))
@@ -729,6 +770,9 @@ def cmd_add_fonts(args: argparse.Namespace) -> None:
         for i in range(0, len(items), 25):
             cmd = ["mkvpropedit", str(target)]
             for name, path in items[i:i + 25]:
+                mime = FONT_MIME_TYPES.get(path.suffix.lower())
+                if mime:
+                    cmd += ["--attachment-mime-type", mime]
                 cmd += ["--attachment-name", name, "--add-attachment", str(path)]
             r = subprocess.run(cmd, capture_output=True, text=True)
             if r.returncode >= 2:
@@ -763,3 +807,34 @@ def cmd_add_fonts(args: argparse.Namespace) -> None:
         print(f"\n{len(still_missing)} font(s) still missing (not in the fonts folder):")
         for f in sorted(still_missing, key=str.lower):
             print(f"  - {f}")
+
+
+def register(sub) -> None:
+    p = add_stage(sub, "check-fonts",
+                  "Check each mkv's ASS/SSA subtitle tracks for fonts that are neither attached nor installed.",
+                  cmd_check_fonts)
+    add_input_dir(p, ".mkv files")
+    p.add_argument("--check-system", action="store_true",
+                   help="Also treat fonts installed on this machine (per fc-list) as present, "
+                        "so only fonts missing from both the mkv and the system are reported.")
+    add_fonts_dir(p, "Folder of font files to also count as available (reported as "
+                     "'in fonts folder, not attached', not as missing).")
+
+    p = add_stage(sub, "dump-fonts",
+                  "Extract every unique attached font from a folder of mkv files into one folder.",
+                  cmd_dump_fonts)
+    add_input_dir(p, ".mkv files")
+    p.add_argument("-o", "--output-dir", default=None, metavar="DIR",
+                   help="Folder to write the unique font files into. Default: a "
+                        f"'{DEFAULT_FONTS_DIRNAME}' folder next to this script.")
+
+    p = add_stage(sub, "add-fonts",
+                  "Attach fonts from the fonts folder to mkvs whose subs use fonts the mkv doesn't carry.",
+                  cmd_add_fonts)
+    add_input_dir(p, ".mkv files")
+    add_fonts_dir(p, "Folder of font files to attach from.")
+    p.add_argument("-o", "--output-dir", default=None, metavar="DIR",
+                   help="Write edited copies of the mkvs here instead of editing the "
+                        "originals in place.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Only show which fonts would be attached; change nothing.")

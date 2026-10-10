@@ -20,12 +20,16 @@ from .common import (
     STYLE_FORMAT_LINE_RE,
     STYLE_LINE_RE,
     TRACKS_META_FILENAME,
+    add_rebuild_args,
+    add_stage,
+    add_track_filters,
     c,
     check_tools,
     find_ass_play_res,
     find_ass_wrap_style,
     fmt_num,
     get_timestamp,
+    parse_resolution,
     read_text_smart,
     rebuild_all_mkvs,
     track_matches_filter,
@@ -431,6 +435,20 @@ def reposition_ass_lines(
 
 
 def cmd_reposition(args: argparse.Namespace) -> None:
+    r"""Adjust ASS/SSA subtitle positioning for a resolution change (letterbox/pillarbox bars).
+
+    An alternative to plan-replace/merge-replace: adjusts an ASS/SSA subtitle's positioning
+    for a resolution change where content is letterboxed or pillarboxed (padded with bars)
+    rather than cropped or stretched. Auto-detects each file's original resolution from its
+    own PlayResX/PlayResY (or use --old-res to override), computes the resulting
+    scale/offset for a centered "contain" fit into --new-res, and adjusts PlayResX/PlayResY,
+    style Fontsize/Outline/Shadow/Spacing/Margins, and inline \pos/\org/\fs/\bord/\shad/\fsp
+    tags accordingly. Any line containing \move(...) or \clip(...)/\iclip(...) is left
+    untouched and reported as a warning instead -- those need per-case judgment (timed
+    motion paths, vector clip regions with their own drawing scale) that isn't safe to
+    transform generically. Requires 'extract' to have been run first; does not require
+    'plan-replace'.
+    """
     check_tools()
     input_dir = Path(args.input_dir).resolve()
     work_dir = Path(args.work_dir).resolve()
@@ -673,3 +691,28 @@ def cmd_reposition(args: argparse.Namespace) -> None:
         return
 
     rebuild_all_mkvs(work_dir, input_dir, output_dir, edited_paths, args.in_place, args.dry_run)
+
+
+def register(sub) -> None:
+    p = add_stage(sub, "reposition",
+                  "Adjust ASS/SSA subtitle positioning for a resolution change "
+                  "(e.g. letterbox/pillarbox bars added instead of cropping).",
+                  cmd_reposition)
+    add_rebuild_args(p, "repositioned/rebuilt")
+    p.add_argument("--new-res", required=True, type=parse_resolution, metavar="WxH",
+                   help="Target video resolution, e.g. 1920x1080.")
+    p.add_argument("--old-res", default=None, type=parse_resolution, metavar="WxH",
+                   help="Override the original resolution instead of auto-detecting each "
+                        "file's own PlayResX/PlayResY.")
+    p.add_argument("--old-content-res", default=None, type=parse_resolution, metavar="WxH",
+                   help="Use this when --new-res REMOVES letterbox/pillarbox padding "
+                        "rather than adding it (e.g. 1920x1080 padded -> 960x720 "
+                        "content-only). Give the actual content's size within the old "
+                        "(padded) frame, e.g. 1440x1080; the content is cropped out and "
+                        "rescaled to exactly fill --new-res. Without this flag, --new-res "
+                        "is assumed to ADD padding around the existing content instead.")
+    add_track_filters(p, "reposition")
+    p.add_argument("--condensed", action="store_true",
+                   help="Print a one-line-per-file summary of review items (\\move/\\clip "
+                        "adjustments, clamped margins, out-of-bounds points) instead of "
+                        "itemizing every instance. Recommended for batch runs across many files.")

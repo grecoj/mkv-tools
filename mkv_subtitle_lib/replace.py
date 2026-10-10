@@ -24,6 +24,9 @@ from .common import (
     SRT_INDEX_RE,
     TEXT_EDITABLE_EXTS,
     TIMESTAMP_RE,
+    add_rebuild_args,
+    add_stage,
+    add_work_dir,
     c,
     check_tools,
     get_timestamp,
@@ -297,6 +300,14 @@ def flush_match_records(rel: Path, records: List[Dict[str, Any]], log_lines: Lis
 
 
 def cmd_plan_replace(args: argparse.Namespace) -> None:
+    r"""Scan extracted subtitles for per-show text replacements and build a plan.
+
+    Scans the extracted subtitle files for lines matching a set of known find/replace rules
+    for the show given via --show. Any line that contains that show's watch word but doesn't
+    match a known rule triggers an interactive prompt asking what it should become.
+    Everything is recorded to a plan JSON file (nothing is modified yet). Requires 'extract'
+    to have been run first.
+    """
     work_dir = Path(args.work_dir).resolve()
     extracted_root = work_dir / EXTRACTED_DIRNAME
     if not extracted_root.exists():
@@ -508,6 +519,13 @@ def apply_replace_plan_to_files(work_dir: Path, plan_entries: List[Dict[str, Any
 
 
 def cmd_merge_replace(args: argparse.Namespace) -> None:
+    r"""Apply the replacement plan and rebuild the mkv files.
+
+    Applies the plan from 'plan-replace' to the extracted subtitle files, then uses mkvmerge
+    to rebuild each .mkv with the edited subtitle tracks swapped in for the originals,
+    keeping every other track and all original metadata (language, track name,
+    default/forced flags, chapters, attachments, etc.) untouched.
+    """
     check_tools()
     input_dir = Path(args.input_dir).resolve()
     work_dir = Path(args.work_dir).resolve()
@@ -530,3 +548,19 @@ def cmd_merge_replace(args: argparse.Namespace) -> None:
     print()
 
     rebuild_all_mkvs(work_dir, input_dir, output_dir, edited_paths, args.in_place, args.dry_run)
+
+
+def register(sub) -> None:
+    p = add_stage(sub, "plan-replace",
+                  "Scan extracted subtitles for per-show text replacements and build a plan.",
+                  cmd_plan_replace)
+    add_work_dir(p)
+    p.add_argument("--show", required=True, choices=sorted(REPLACE_RULES),
+                   help="Which show's built-in rule set to use.")
+    p.add_argument("--rules-file", default=None,
+                   help="Optional JSON file of extra {\"find\": \"replace\"} rules "
+                        "to add on top of the selected show's built-in rules.")
+
+    p = add_stage(sub, "merge-replace", "Apply the replacement plan and rebuild the mkv files.",
+                  cmd_merge_replace)
+    add_rebuild_args(p, "rebuilt", used_by="'extract'/'plan-replace'")

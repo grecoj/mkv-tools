@@ -2,7 +2,7 @@
 """
 Launcher for the mkv subtitle tool. The implementation lives in the
 mkv_subtitle_lib/ folder next to this file (see its __init__.py for a module
-index); usage docs are in mkv_subtitle_lib/cli.py. Keep this file, the
+index). Run `python mkv_subtitle_tool.py --help` (or `<stage> --help`) for usage. Keep this file, the
 mkv_subtitle_lib/ folder, and (optionally) mkv_subtitle_fonts/ together.
 """
 import sys

@@ -12,6 +12,9 @@ from .common import (
     EXTRACTED_DIRNAME,
     TEXT_EDITABLE_EXTS,
     TRACKS_META_FILENAME,
+    add_input_dir,
+    add_stage,
+    add_work_dir,
     c,
     check_tools,
     find_mkvs,
@@ -36,6 +39,13 @@ CODEC_EXTENSIONS: Dict[str, str] = {
 
 
 def cmd_extract(args: argparse.Namespace) -> None:
+    r"""Extract all subtitle tracks from every mkv in a folder.
+
+    Pulls every subtitle track out of every .mkv in a folder, preserving each track's
+    metadata (language, name, default/forced flags) in a sidecar JSON file so it can be
+    restored later. Run this first: plan-replace, merge-replace, trim, reposition and
+    style-sync all work from its output.
+    """
     check_tools()
     input_dir = Path(args.input_dir).resolve()
     work_dir = Path(args.work_dir).resolve()
@@ -118,3 +128,9 @@ def cmd_extract(args: argparse.Namespace) -> None:
               f"({editable} text-editable, {skipped} image/binary - not editable).\n")
 
     print(f"Done. Extracted subtitles are under: {out_root}")
+
+
+def register(sub) -> None:
+    p = add_stage(sub, "extract", "Extract all subtitle tracks from every mkv in a folder.", cmd_extract)
+    add_input_dir(p, ".mkv files")
+    add_work_dir(p, used_by=None)

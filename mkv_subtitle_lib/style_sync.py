@@ -16,6 +16,10 @@ from .common import (
     STYLE_LINE_RE,
     STYLE_SYNCED_DIRNAME,
     TRACKS_META_FILENAME,
+    add_fonts_dir,
+    add_rebuild_args,
+    add_stage,
+    add_track_filters,
     c,
     check_tools,
     default_fonts_dir,
@@ -192,6 +196,17 @@ def sync_styles(
 
 
 def cmd_style_sync(args: argparse.Namespace) -> None:
+    r"""Make a show's named subtitle styles match a reference look, scaled per file.
+
+    Makes a show's named [V4+ Styles] entries (e.g. Main, Italics, Flashback) match a
+    reference look (font, size, colors, outline, shadow, margins) defined per-show via
+    --show, scaling pixel-sized fields by (this file's own PlayResY / the rule's reference
+    PlayResY) so releases using different reference resolutions still end up visually
+    consistent. Name, Italic, and Alignment are always left alone -- they're what make each
+    named style distinct, not part of the "look." A style listed in the rule but absent from
+    a given file is skipped, not an error. Requires 'extract' to have been run first; does
+    not require 'plan-replace'.
+    """
     check_tools()
     input_dir = Path(args.input_dir).resolve()
     work_dir = Path(args.work_dir).resolve()
@@ -343,3 +358,22 @@ def cmd_style_sync(args: argparse.Namespace) -> None:
 
     rebuild_all_mkvs(work_dir, input_dir, output_dir, edited_paths, args.in_place, args.dry_run,
                       added_subs_by_mkv, attach_files)
+
+
+def register(sub) -> None:
+    p = add_stage(sub, "style-sync",
+                  "Make a show's named subtitle styles (font/size/colors/margins) match a reference look, "
+                  "scaled for each file's own resolution.",
+                  cmd_style_sync)
+    add_rebuild_args(p, "synced/rebuilt")
+    p.add_argument("--show", required=True, choices=sorted(STYLE_SYNC_RULES),
+                   help="Which show's style-sync rule set to use.")
+    add_track_filters(p, "sync")
+    p.add_argument("--generate-signs-track", action="store_true",
+                   help="Also generate a new subtitle track per processed file, containing "
+                        "only the Dialogue/Comment lines whose style is NOT one of the "
+                        "show's dialogue styles (--show's style_names) -- i.e. signs, "
+                        "titles, and any other non-dialogue typesetting. Added as a new "
+                        "track alongside the original(s), not a replacement.")
+    add_fonts_dir(p, "Folder to look up this show's required font files (rule set's 'fonts' list) in, "
+                     "for attaching to the rebuilt mkv.")
