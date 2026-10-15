@@ -57,9 +57,16 @@ RULES APPLIED TO EACH FILE:
     Include/exclude filters (all optional, case-insensitive substring match
     against each track's name):
         - Filters are applied per language group, after the language
-          keep/remove decision above, so they only ever narrow down within
-          eng or jpn audio, or eng subtitles -- they can't pull in a track
-          of an otherwise-excluded language.
+          keep/remove decision above, so they narrow down within the kept
+          audio languages, or within English subtitles.
+        - One exception: --audio-include is also an explicit opt-in for
+          audio. An audio track outside the kept languages (e.g. an
+          "und"-tagged "Isolated Score" track) is kept if its name matches
+          an include keyword, and is never set default. --audio-exclude
+          still wins over this.
+        - --sub-include works the same way for subtitles: a non-English
+          subtitle track whose name matches an include keyword is kept
+          (never as default), and --sub-exclude still wins.
         - --audio-exclude / --sub-exclude: drop any track whose name
           contains one of the given keywords.
         - --audio-include / --sub-include: from what's left after exclude
@@ -147,12 +154,14 @@ USAGE:
                           (overrides the per-track default below).
     --no-default          Force every kept subtitle track's default flag to
                           "no" (no subtitle track will be default at all).
-    --audio-include KW    Keep only kept-language audio tracks matching KW
-                          (repeatable / comma-separated).
+    --audio-include KW    Keep only kept-language audio tracks matching KW,
+                          and also keep any other-language audio track
+                          matching KW (repeatable / comma-separated).
     --audio-exclude KW    Drop audio tracks matching KW (repeatable /
                           comma-separated).
-    --sub-include KW      Keep only English subtitle tracks matching KW
-                          (repeatable / comma-separated).
+    --sub-include KW      Keep only English subtitle tracks matching KW,
+                          and also keep any non-English subtitle track
+                          matching KW (repeatable / comma-separated).
     --sub-exclude KW      Drop English subtitle tracks matching KW
                           (repeatable / comma-separated).
     --audio-lang-override KEYWORD=LANG
@@ -385,7 +394,9 @@ def parse_args():
     parser.add_argument(
         "--audio-include", action="append", default=None,
         help="Keep only audio tracks (within a kept language) whose name matches this keyword. "
-             "Repeatable, or comma-separated (e.g. --audio-include commentary,director)"
+             "Also keeps audio tracks in any other language (e.g. 'und') whose name matches, "
+             "never as default. --audio-exclude still wins. "
+             "Repeatable, or comma-separated (e.g. --audio-include isolated,director)"
     )
     parser.add_argument(
         "--audio-exclude", action="append", default=None,
@@ -395,7 +406,8 @@ def parse_args():
     parser.add_argument(
         "--sub-include", action="append", default=None,
         help="Keep only English subtitle tracks whose name matches this keyword. "
-             "Repeatable, or comma-separated (e.g. --sub-include signs,full)"
+             "Also keeps non-English subtitle tracks whose name matches, never as default. "
+             "--sub-exclude still wins. Repeatable, or comma-separated (e.g. --sub-include signs,full)"
     )
     parser.add_argument(
         "--sub-exclude", action="append", default=None,
@@ -845,12 +857,15 @@ def decide_tracks(tracks: list, language: str,
 
     eng_audio_all = []
     secondary_audio_all = []
+    other_audio_all = []  # tracks in neither kept language (e.g. language "und")
     for t in audio_tracks:
         effective, _ = resolve_track_lang(t, audio_lang_override)
         if effective == "eng":
             eng_audio_all.append(t)
         elif effective == secondary_bucket:
             secondary_audio_all.append(t)
+        else:
+            other_audio_all.append(t)
 
     eng_audio, eng_removed = filter_by_keywords(eng_audio_all, audio_include, audio_exclude, "audio", "English audio tracks")
     secondary_audio, secondary_removed = filter_by_keywords(
@@ -858,7 +873,21 @@ def decide_tracks(tracks: list, language: str,
     for t, reason in eng_removed + secondary_removed:
         removal_reasons[t["id"]] = reason
 
-    keep_audio = eng_audio + secondary_audio
+    # --audio-include also acts as an explicit opt-in: an audio track outside
+    # the kept languages (e.g. an "und"-tagged isolated score track) is kept
+    # if its name matches an include keyword. --audio-exclude still wins.
+    extra_audio = []
+    if audio_include:
+        for t in other_audio_all:
+            name = track_name(t)
+            if not matches_any_keyword(name, audio_include):
+                continue
+            if audio_exclude and matches_any_keyword(name, audio_exclude):
+                removal_reasons[t["id"]] = "excluded by --audio-exclude"
+            else:
+                extra_audio.append(t)
+
+    keep_audio = eng_audio + secondary_audio + extra_audio
 
     default_ids = set()
     no_default_ids = set()
@@ -867,15 +896,41 @@ def decide_tracks(tracks: list, language: str,
         pick_audio_default(eng_audio, secondary_audio, default_ids, no_default_ids)
     else:  # jap, cn, or ger
         pick_audio_default(secondary_audio, eng_audio, default_ids, no_default_ids)
+    no_default_ids.update(t["id"] for t in extra_audio)  # never default
 
     # ---- Subtitles: keep only eng (after language overrides), then apply include/exclude filters ----
-    eng_subs_all = [t for t in subtitle_tracks if resolve_track_lang(t, sub_lang_override)[0] == "eng"]
-    keep_subs, subs_removed = filter_by_keywords(eng_subs_all, sub_include, sub_exclude, "sub", "English subtitle tracks")
+    eng_subs_all = []
+    other_subs_all = []  # non-English subtitle tracks
+    for t in subtitle_tracks:
+        if resolve_track_lang(t, sub_lang_override)[0] == "eng":
+            eng_subs_all.append(t)
+        else:
+            other_subs_all.append(t)
+    eng_subs, subs_removed = filter_by_keywords(eng_subs_all, sub_include, sub_exclude, "sub", "English subtitle tracks")
     for t, reason in subs_removed:
         removal_reasons[t["id"]] = reason
 
-    signs_subs = [t for t in keep_subs if is_signs_track(t)]
-    non_signs_subs = [t for t in keep_subs if not is_signs_track(t)]
+    # --sub-include is also an explicit opt-in: a non-English subtitle track
+    # is kept if its name matches an include keyword. --sub-exclude still
+    # wins. Such tracks never become the default (default selection below
+    # only considers the English tracks).
+    extra_subs = []
+    if sub_include:
+        for t in other_subs_all:
+            name = track_name(t)
+            if not matches_any_keyword(name, sub_include):
+                continue
+            if sub_exclude and matches_any_keyword(name, sub_exclude):
+                removal_reasons[t["id"]] = "excluded by --sub-exclude"
+            else:
+                extra_subs.append(t)
+
+    # Keep source track order across the English and opted-in tracks.
+    kept_sub_ids = {t["id"] for t in eng_subs} | {t["id"] for t in extra_subs}
+    keep_subs = [t for t in subtitle_tracks if t["id"] in kept_sub_ids]
+
+    signs_subs = [t for t in eng_subs if is_signs_track(t)]
+    non_signs_subs = [t for t in eng_subs if not is_signs_track(t)]
 
     if no_default_subs:
         # --no-default: skip signs-track selection entirely, nothing is default.
@@ -945,12 +1000,12 @@ def build_track_layout_signature(keep_audio, keep_subs, default_ids, forced_sub_
     kept audio and subtitle tracks, in the same order.
     """
     audio_sig = tuple(
-        (resolve_track_lang(t, audio_lang_override)[0], track_name(t), t["id"] in default_ids)
+        (resolve_track_lang(t, audio_lang_override)[0] or get_lang(t), track_name(t), t["id"] in default_ids)
         for t in keep_audio
     )
     subs_sig = tuple(
         (
-            resolve_track_lang(t, sub_lang_override)[0],
+            resolve_track_lang(t, sub_lang_override)[0] or get_lang(t),
             track_name(t),
             t["id"] in default_ids,
             resolve_final_forced(t, forced_sub_id, forced_mode),
