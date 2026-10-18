@@ -157,9 +157,21 @@ def target_layout_for_channels(
     return {6: "5.1", 8: "7.1"}.get(channels)
 
 
-# Matches lossless-codec names that might appear in an existing track title,
-# ordered most-specific first so "DTS-HD MA" isn't partially matched by "DTS".
-CODEC_NAME_PATTERN = re.compile(r"DTS-HD\s*MA|TrueHD|DTS|FLAC", re.IGNORECASE)
+# Matches codec names that might appear in an existing track title, ordered
+# most-specific first so the DTS-HD variants are consumed whole instead of
+# being partially matched by the bare "DTS" alternative (which would turn
+# "DTS-HD Master Audio" into "Opus-HD Master Audio"). Handles, with any mix
+# of space/hyphen/dot separators and any case:
+#   DTS-HD Master Audio, DTS-HD MA, a bare DTS-HD / DTS HD, plus TrueHD,
+#   DTS and FLAC.
+# The (?![A-Za-z]) guard stops "MA" from matching the start of a longer
+# word.
+CODEC_NAME_PATTERN = re.compile(
+    r"DTS[-\s]?HD"
+    r"(?:[-\s.]*(?:Master[-\s]*Audio|MA)(?![A-Za-z]))?"
+    r"|TrueHD|DTS|FLAC",
+    re.IGNORECASE,
+)
 
 # Common ISO 639-2 (and a few 639-1) language codes as seen in MKV tags.
 LANGUAGE_NAMES = {
@@ -209,9 +221,10 @@ def language_name(language_code: str) -> str:
 
 def compute_title(original_title: str, layout: str | None, language: str = "", force_rename: bool = False) -> str:
     """
-    If the source title mentions the original codec (FLAC/DTS/TrueHD),
-    rename that portion to "Opus" so e.g. "Japanese DTS-HD MA 5.1"
-    becomes "Japanese Opus 5.1". If there's no title at all, build one
+    If the source title mentions the original codec (FLAC/DTS/TrueHD,
+    including "DTS-HD Master Audio" and "DTS-HD MA"), rename that portion
+    to "Opus" so e.g. "Japanese DTS-HD Master Audio 5.1" becomes
+    "Japanese Opus 5.1". If there's no title at all, build one
     from the language and channel layout instead, e.g. "English 5.1" --
     always in this format, even for an unrecognized/missing language
     code (see language_name). If a title exists but doesn't mention a

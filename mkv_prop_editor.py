@@ -528,12 +528,20 @@ def lang_display_name(raw_lang: str) -> str:
     return raw_lang.upper() if len(raw_lang) <= 3 else raw_lang.title()
 
 
+# Codec names (as reported by mkvmerge) shortened for --auto-name-audio.
+# Add entries here to rename other codecs in auto-generated names.
+_AUTO_NAME_CODEC_ALIASES = {
+    "DTS-HD Master Audio": "DTS-HD MA",
+}
+
+
 def compute_auto_audio_name(track: dict) -> str:
     """The --auto-name-audio name for an audio track: '<Language> <Channel
     layout> <Codec>', e.g. 'English 5.1 FLAC'."""
     lang_name = lang_display_name(get_lang(track))
     ch_label = channel_layout_label(get_audio_layout(track))
     codec = track.get("codec") or "?"
+    codec = _AUTO_NAME_CODEC_ALIASES.get(codec, codec)
     return f"{lang_name} {ch_label} {codec}"
 
 
