@@ -9,9 +9,9 @@ is dropped.
 
 Bitrate mapping (by channel count/layout of each lossless track), per --quality tier:
     2.0 (stereo)    -> medium: 160k   high (default): 192k
-    2.1 (L/R/LFE)   -> medium: 192k   high (default): 224k
-    3.0 (L/R/C)     -> medium: 256k   high (default): 288k
-    3.1 (L/R/C/LFE) -> medium: 288k   high (default): 320k
+    2.1 (L/R/LFE)   -> medium: 192k   high (default): 224k   (opt-in, see below)
+    3.0 (L/R/C)     -> medium: 256k   high (default): 288k   (opt-in, see below)
+    3.1 (L/R/C/LFE) -> medium: 288k   high (default): 320k   (opt-in, see below)
     5.1 (6ch)       -> medium: 384k   high (default): 448k
     7.1 (8ch)       -> medium: 448k   high (default): 510k
     other           -> copied as-is (unknown target bitrate), flagged
@@ -20,17 +20,20 @@ Non-lossless audio (AC3, DTS core, existing Opus, AAC, etc.) is always
 copied as-is and flagged. Plain "DTS" (the lossy core, without the "MA"
 extension) is treated as lossy and copied rather than re-encoded.
 
-3-channel lossless tracks are ambiguous (could be L/R/LFE "2.1" or L/R/C
-"3.0") and require --three-channel-layout to be passed explicitly; a
-4-channel track is similarly ambiguous (could be L/R/C/LFE "3.1", or
-"quad"/"4.0", which have no LFE at all) and requires
---four-channel-layout. Neither is auto-detected (see plan_audio_tracks
-docstring for why -- ffmpeg's own encoders can write a misleading
-default guess into a file's metadata that's indistinguishable from a
-genuine one).
+3-channel and 4-channel lossless tracks are copied as-is by default. Their
+layouts are ambiguous (3ch could be L/R/LFE "2.1" or L/R/C "3.0"; 4ch could
+be L/R/C/LFE "3.1", or "quad"/"4.0", which have no LFE at all), and the
+resulting Opus files use channel mappings that some players handle poorly.
+To convert them anyway, pass --three-channel-layout and/or
+--four-channel-layout to say what the layout really is; a warning about
+possible playback compatibility problems is then printed for each such
+track. Layouts are never auto-detected (see plan_audio_tracks docstring
+for why -- ffmpeg's own encoders can write a misleading default guess
+into a file's metadata that's indistinguishable from a genuine one).
 
 Usage:
     python3 opus_convert.py [-i INPUT_DIR] [-o OUTPUT_DIR] [-r] [--quality high|medium] [--dry-run]
+                            [--three-channel-layout 2.1|3.0] [--four-channel-layout 3.1]
     python3 opus_convert.py --restore [-i INPUT_DIR] [-o OUTPUT_DIR] [-y] [--dry-run]
 
     -i, --input-directory   Directory containing .mkv files (default: current directory)
@@ -128,14 +131,14 @@ def bitrate_for_channels(
             # Three full-bandwidth channels (L/R/C); more demanding than
             # stereo but with no surrounds/LFE to offload bits to.
             return "288k" if high else "256k"
-        return None  # layout not yet known -- caller handles this as 'blocked'
+        return None  # layout not specified -- plan_audio_tracks copies these instead
     if channels == 4:
         if four_channel_layout == "3.1":
             # Three full-bandwidth channels (L/R/C) plus a band-limited
             # LFE channel -- same reasoning as 3.0 plus the small LFE
             # increment seen in the 2.0 -> 2.1 step.
             return "320k" if high else "288k"
-        return None  # layout not yet known -- caller handles this as 'blocked'
+        return None  # layout not specified -- plan_audio_tracks copies these instead
     if channels == 6:
         return "448k" if high else "384k"
     if channels == 8:
@@ -242,16 +245,19 @@ def plan_audio_tracks(
     Build a per-audio-track plan. Each entry:
         audio_index: 0-based index among audio streams only (matches ffmpeg's a:N)
         codec, profile, channels, language
-        action: 'convert' | 'copy' | 'blocked'
+        action: 'convert' | 'copy'
         reason: human-readable explanation
-        bitrate: target bitrate string, or None if copying/blocked
+        bitrate: target bitrate string, or None if copying
         layout: target channel layout for the aformat filter, or None
+        warning: (optional) set on 'convert' entries that carry a known
+                 playback-compatibility risk (3- and 4-channel Opus)
 
     A 3-channel lossless track is ambiguous (could be L/R/LFE "2.1" or
     L/R/C "3.0") and a 4-channel one similarly so (L/R/C/LFE "3.1" vs.
-    "quad"/"4.0", which have no LFE at all) -- both are marked 'blocked'
+    "quad"/"4.0", which have no LFE at all) -- both are copied as-is
     unless the corresponding --N-channel-layout flag was explicitly
-    provided by the caller. This is deliberately NOT auto-detected from
+    provided by the caller, in which case they are converted and flagged
+    with a compatibility warning. This is deliberately NOT auto-detected from
     the source's reported channel_layout: testing showed ffmpeg's own
     encoders can silently write an incorrect guess (e.g. "2.1" for a
     3-channel FLAC with no explicit layout given, when the FLAC spec's
@@ -290,18 +296,18 @@ def plan_audio_tracks(
             entry["bitrate"] = None
             entry["layout"] = None
         elif channels == 3 and three_channel_layout is None:
-            entry["action"] = "blocked"
+            entry["action"] = "copy"
             entry["reason"] = (
-                "3-channel lossless track is ambiguous (L/R/LFE vs L/R/C) -- "
-                "pass --three-channel-layout 2.1 or --three-channel-layout 3.0"
+                "3-channel lossless track copied by default (layout is ambiguous: L/R/LFE vs L/R/C) -- "
+                "pass --three-channel-layout 2.1 or 3.0 to convert it to Opus"
             )
             entry["bitrate"] = None
             entry["layout"] = None
         elif channels == 4 and four_channel_layout is None:
-            entry["action"] = "blocked"
+            entry["action"] = "copy"
             entry["reason"] = (
-                "4-channel lossless track is ambiguous (L/R/C/LFE vs quad/other 4ch layouts) -- "
-                "pass --four-channel-layout 3.1"
+                "4-channel lossless track copied by default (layout is ambiguous: L/R/C/LFE vs quad/other) -- "
+                "pass --four-channel-layout 3.1 to convert it to Opus"
             )
             entry["bitrate"] = None
             entry["layout"] = None
@@ -318,6 +324,11 @@ def plan_audio_tracks(
                 entry["reason"] = f"{label} {channels}ch"
                 entry["bitrate"] = bitrate
                 entry["layout"] = target_layout_for_channels(channels, three_channel_layout, four_channel_layout)
+                if channels in (3, 4):
+                    entry["warning"] = (
+                        f"{channels}-channel Opus ({entry['layout']}) may have playback compatibility "
+                        "issues in some players (wrong channel mapping, missing channels, or silence)"
+                    )
 
         plan.append(entry)
         audio_idx += 1
@@ -442,8 +453,8 @@ def print_plan(fname: str, plan: list, dry_run: bool, force_rename: bool = False
         if e["action"] == "convert":
             new_title = compute_title(e["title"], e["layout"], e["language"], force_rename)
             print(c(f"  {tag} -> Opus @ {e['bitrate']} | title: \"{new_title}\"", C.GREEN))
-        elif e["action"] == "blocked":
-            print(c(f"  {tag} -> BLOCKED ({e['reason']})", C.RED))
+            if e.get("warning"):
+                print(c(f"    ! WARNING: {e['warning']}", C.YELLOW))
         else:
             print(c(f"  {tag} -> COPY ({e['reason']})", C.YELLOW))
 
@@ -588,11 +599,13 @@ def main() -> None:
     parser.add_argument("-y", "--yes", action="store_true", help="Don't prompt for confirmation when restoring")
     parser.add_argument(
         "--three-channel-layout", choices=["2.1", "3.0"], default=None,
-        help="Required if any 3-channel lossless track is present: '2.1' for L/R/LFE, '3.0' for L/R/C",
+        help="Convert 3-channel lossless tracks to Opus, treating them as '2.1' (L/R/LFE) or '3.0' (L/R/C). "
+             "Without this flag, 3-channel tracks are copied as-is. Converting may cause playback compatibility issues in some players.",
     )
     parser.add_argument(
         "--four-channel-layout", choices=["3.1"], default=None,
-        help="Required if any 4-channel lossless track is present: '3.1' for L/R/C/LFE",
+        help="Convert 4-channel lossless tracks to Opus, treating them as '3.1' (L/R/C/LFE). "
+             "Without this flag, 4-channel tracks are copied as-is. Converting may cause playback compatibility issues in some players.",
     )
     args = parser.parse_args()
 
@@ -684,13 +697,9 @@ def main() -> None:
         plan = plan_audio_tracks(streams, args.quality, args.three_channel_layout, args.four_channel_layout)
         print_plan(display_name, plan, args.dry_run, args.rename)
 
-        blocked = [e for e in plan if e["action"] == "blocked"]
-        if blocked:
-            for e in blocked:
-                errors.append(f"{display_name}: audio[{e['audio_index']}]: {e['reason']}")
-            if same_dir and not args.dry_run:
-                shutil.move(str(f), str(original_path))
-            continue
+        for e in plan:
+            if e.get("warning"):
+                warnings.append(f"{display_name}: audio[{e['audio_index']}]: {e['warning']}")
 
         needs_conversion = any(e["action"] == "convert" for e in plan)
         if not needs_conversion:

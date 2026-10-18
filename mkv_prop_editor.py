@@ -103,10 +103,18 @@ BATCH CONSISTENCY CHECK (the main safety mechanism):
         2. Records a signature of that file's input track layout (the
            language, name, default flag, forced flag, and -- for audio --
            channel count of every audio and subtitle track, in order).
-           Channel counts are shown as a conventional layout label (2.0,
-           5.1, 7.1, ...) rather than the raw channel number; mkvmerge only
-           reports a channel count, not the actual speaker layout, so this
-           is the common-case convention, not a guaranteed-accurate label.
+           Channels are shown as a layout label (2.0, 3.1, 4.0, 5.1, 7.1,
+           ...) rather than the raw channel number. mkvmerge only reports a
+           channel count, so the real speaker layout is read with ffprobe
+           when it is installed (this is what tells 3.0/2.1 and 3.1/4.0
+           apart). If ffprobe is missing, or a track carries no explicit
+           layout, a count-based convention is used instead (3 -> 2.1,
+           4 -> 3.1, 6 -> 5.1, 8 -> 7.1). The dry-run output says which
+           happened: the 'name:' line of each auto-named 3/4-channel
+           track ends with '(detected by ffprobe)' or '(GUESSED ...)' (any
+           other count only gets a note when guessed), --list marks guessed layouts
+           with a trailing '?', and a warning is printed up front if
+           ffprobe isn't installed.
 
     If every file resolves every selector cleanly AND every file's layout
     signature matches the most common ("standard") one, the batch is
@@ -196,6 +204,7 @@ import argparse
 import collections
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -523,7 +532,7 @@ def compute_auto_audio_name(track: dict) -> str:
     """The --auto-name-audio name for an audio track: '<Language> <Channel
     layout> <Codec>', e.g. 'English 5.1 FLAC'."""
     lang_name = lang_display_name(get_lang(track))
-    ch_label = channel_layout_label(get_audio_channels(track))
+    ch_label = channel_layout_label(get_audio_layout(track))
     codec = track.get("codec") or "?"
     return f"{lang_name} {ch_label} {codec}"
 
@@ -661,7 +670,9 @@ def get_track_info(mkv_path: Path) -> dict:
         ["mkvmerge", "-J", str(mkv_path)],
         capture_output=True, text=True, check=True
     )
-    return json.loads(result.stdout)
+    info = json.loads(result.stdout)
+    annotate_audio_layouts(info.get("tracks", []), mkv_path)
+    return info
 
 
 def get_lang(track: dict) -> str:
@@ -683,7 +694,7 @@ def is_currently_forced(track: dict) -> bool:
 
 
 _CHANNEL_LAYOUT_LABELS = {
-    1: "1.0", 2: "2.0", 3: "2.1", 4: "4.0", 5: "5.0",
+    1: "1.0", 2: "2.0", 3: "2.1", 4: "3.1", 5: "5.0",
     6: "5.1", 7: "6.1", 8: "7.1", 10: "7.1.2", 12: "7.1.4",
 }
 
@@ -696,14 +707,109 @@ def get_audio_channels(track: dict):
     return (track.get("properties", {}) or {}).get("audio_channels")
 
 
+_FFPROBE_LAYOUT_ALIASES = {
+    "mono": "1.0", "stereo": "2.0", "downmix": "2.0", "quad": "4.0",
+    "hexagonal": "6.0", "octagonal": "7.0",
+}
+
+
+def normalize_ffprobe_layout(layout, channels):
+    """Turn an ffprobe channel_layout string into an 'N.N' / 'N.N.N' label
+    (e.g. 'quad(side)' -> '4.0', '5.1(side)' -> '5.1', '3.1' -> '3.1').
+    Returns None if the layout is missing/unnamed (ffprobe prints e.g.
+    '3 channels' when the stream carries no real layout) or if its speaker
+    count doesn't match the track's channel count."""
+    if not layout:
+        return None
+    base = re.sub(r"\(.*?\)", "", layout).strip().lower()
+    base = _FFPROBE_LAYOUT_ALIASES.get(base, base)
+    if not re.fullmatch(r"\d+\.\d+(\.\d+)?", base):
+        return None
+    if sum(int(x) for x in base.split(".")) != channels:
+        return None
+    return base
+
+
+def get_audio_layouts(mkv_path: Path) -> list:
+    """(channels, channel_layout) for each audio stream, in file order, via
+    ffprobe. Returns [] if ffprobe is missing or fails -- callers then fall
+    back to the count-based labels."""
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a",
+             "-show_entries", "stream=channels,channel_layout", "-of", "json", str(mkv_path)],
+            capture_output=True, text=True, check=True
+        )
+        streams = json.loads(result.stdout).get("streams", [])
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+        return []
+    return [(s.get("channels"), s.get("channel_layout")) for s in streams]
+
+
+def annotate_audio_layouts(tracks: list, mkv_path: Path) -> None:
+    """Stash the real speaker layout (from ffprobe) on each audio track dict
+    as '_layout_label', when it can be determined reliably. ffprobe's audio
+    streams are matched to mkvmerge's audio tracks by order, and a stream is
+    only used if its channel count agrees with mkvmerge's."""
+    audio = [t for t in tracks if t.get("type") == "audio"]
+    if not audio:
+        return
+    probed = get_audio_layouts(mkv_path)
+    if len(probed) != len(audio):
+        return
+    for t, (ff_channels, ff_layout) in zip(audio, probed):
+        count = get_audio_channels(t)
+        if count is None or ff_channels != count:
+            continue
+        label = normalize_ffprobe_layout(ff_layout, count)
+        if label:
+            t["_layout_label"] = label
+
+
+def get_audio_layout(track: dict):
+    """Layout label for an audio track (e.g. '3.1', '4.0', '5.1'): the
+    ffprobe-detected one if available, else the count-based convention.
+    Always a string for audio tracks (so file-to-file comparisons stay
+    consistent), None for non-audio tracks."""
+    if track.get("type") != "audio":
+        return None
+    return track.get("_layout_label") or channel_layout_label(get_audio_channels(track))
+
+
+def layout_source_note(track: dict):
+    """A short suffix for the 'name:' line saying where an audio track's
+    layout label came from, or "" when there's nothing worth saying.
+    3- and 4-channel tracks always get a note (detected via ffprobe vs
+    GUESSED from the count), since those are the counts where the count
+    alone is ambiguous; any other count (except mono/stereo) only gets a
+    note when the label was guessed."""
+    if track.get("type") != "audio":
+        return ""
+    count = get_audio_channels(track)
+    if track.get("_layout_label"):
+        return c_dim("  (detected by ffprobe)") if count in (3, 4) else ""
+    if count is None or count <= 2:
+        return ""
+    return c_warn(f"  (GUESSED from {count}-channel count; no layout detected)")
+
+
+def warn_if_no_ffprobe() -> None:
+    if shutil.which("ffprobe") is None:
+        print(c_warn("WARNING: ffprobe not found on PATH -- audio layouts (3.0 vs 2.1, 3.1 vs 4.0, ...) "
+                     "will be GUESSED from the channel count."))
+        print()
+
+
 def channel_layout_label(channels) -> str:
-    """A conventional 'N.1'-style layout label for a channel count, e.g.
-    2 -> '2.0', 6 -> '5.1', 8 -> '7.1'. mkvmerge only reports a channel
-    COUNT, not the actual speaker layout, so this is the common-case
-    convention rather than a guaranteed-accurate layout (e.g. 6 channels
-    is almost always 5.1, but could technically be something else)."""
+    """A layout label for a channel count, e.g. 2 -> '2.0', 6 -> '5.1',
+    8 -> '7.1'. An already-resolved label string (from get_audio_layout) is
+    returned unchanged. A bare COUNT is only the common-case convention --
+    mkvmerge doesn't report the speaker layout -- which is why 3 and 4
+    channels are resolved via ffprobe first (see annotate_audio_layouts)."""
     if channels is None:
         return "?"
+    if isinstance(channels, str):
+        return channels
     return _CHANNEL_LAYOUT_LABELS.get(channels, f"{channels}ch")
 
 
@@ -800,7 +906,7 @@ def build_layout_signature(tracks: list):
     order. Two files with the same signature have identical input track
     layouts."""
     audio = tuple(
-        (get_lang(t), track_name(t), is_currently_default(t), is_currently_forced(t), get_audio_channels(t))
+        (get_lang(t), track_name(t), is_currently_default(t), is_currently_forced(t), get_audio_layout(t))
         for t in tracks if t["type"] == "audio"
     )
     subs = tuple(
@@ -982,9 +1088,9 @@ def print_file_diff(probe: FileProbe):
                 print(f"        name:    \"{old}\" -> {c_change('(deleted)')}" if old
                       else f"        name:    (no name) -> {c_dim('(deleted, already unset)')}")
             elif new == old:
-                print(f"        name:    \"{old}\" {c_dim('(unchanged)')}")
+                print(f"        name:    \"{old}\" {c_dim('(unchanged)')}{layout_source_note(t)}")
             else:
-                print(f"        name:    \"{old}\" -> {c_change(chr(34) + new + chr(34))}")
+                print(f"        name:    \"{old}\" -> {c_change(chr(34) + new + chr(34))}{layout_source_note(t)}")
 
         if "language" in props:
             old = get_lang(t)
@@ -1064,8 +1170,10 @@ def build_track_lines(tracks: list, standard_sig=None) -> list:
             name = track_name(t)
             default = is_currently_default(t)
             forced = is_currently_forced(t)
-            channels = get_audio_channels(t)
+            channels = get_audio_layout(t)
             ch_label = channel_layout_label(channels) if channels is not None else "-"
+            if channels is not None and not t.get("_layout_label") and (get_audio_channels(t) or 0) > 2:
+                ch_label += "?"   # guessed from channel count, not detected
             name_display = f'"{name}"' if name else "(no name)"
 
             if std is None:
@@ -1288,6 +1396,7 @@ def main():
         mkv_files = discover()
         if not mkv_files:
             return
+        warn_if_no_ffprobe()
         run_list_command(mkv_files, scan_root)
         return
 
@@ -1318,6 +1427,8 @@ def main():
     print()
 
     # ---- Phase 1: probe every file, resolve selectors, never write anything ----
+    if args.auto_name_audio:
+        warn_if_no_ffprobe()
     print(c_header(f"Inspecting {len(mkv_files)} file(s)..."))
     probes = [probe_file(p, specs, auto_name_audio=args.auto_name_audio) for p in mkv_files]
     for p in probes:
