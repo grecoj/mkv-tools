@@ -84,6 +84,43 @@ RULES APPLIED TO EACH FILE:
           to disable this default (any --audio-exclude / --sub-exclude
           values you do pass still apply on top of that).
 
+    Track ordering (optional):
+        - By default, kept tracks are written in their original source order.
+          --audio-order and --sub-order let you reorder the kept audio and
+          subtitle tracks in the output. Each takes an ordered, comma-separated
+          list (and/or can be repeated); tracks are placed in the order the
+          items appear.
+        - Each item is either a language (eng/en/english, jpn/jp/ja/japanese,
+          chi/zho/zh/cn/chinese, ger/deu/de/german) or a track-name keyword
+          (case-insensitive substring match, same as the include/exclude
+          filters). An item that is a known language alias is treated as a
+          language; anything else is treated as a name keyword. Prefix an item
+          with "name:" to force keyword matching (e.g. "name:de" to match the
+          text "de" in a track name rather than the German language), or with
+          "lang:" to force language matching.
+        - Language matching uses the effective language, i.e. after any
+          --audio-lang-override / --sub-lang-override has been applied.
+        - Within one item, matching tracks keep their source order. A track
+          is only placed once (by the first item that matches it). Kept tracks
+          that match no item are placed after the ordered ones, in source
+          order, so nothing is ever dropped by ordering.
+        - Ordering never changes which tracks are kept. It DOES affect which
+          track is picked as default, because every "first remaining ..."
+          rule above uses the new order: e.g. with -l jap and
+          --audio-order "name:japanese 3.1,name:japanese 2.0", the 3.1 track
+          is the default audio, not whichever Japanese track came first in
+          the source. The same applies to the first signs / non-signs
+          subtitle candidate under --sub-order. Video tracks always come
+          first, then audio, then subtitles, whenever either order flag
+          is used.
+        - If an order item matches no kept track in a file, a WARNING is
+          printed for that file (on every run, not just --dry-run) saying
+          so, and noting if it matches only a track that was removed (e.g.
+          an excluded commentary track). The item is then simply skipped;
+          the file is still processed.
+        - Without either flag, no --track-order is passed to mkvmerge at all,
+          so existing behavior is completely unchanged.
+
     Language overrides (for tracks with incorrect language metadata):
         - Some releases mislabel a track's language (e.g. an audio track
           named "English 2.0" tagged as jpn). --audio-lang-override and
@@ -117,6 +154,8 @@ USAGE:
     python mkv_track_cleaner.py -l ger [-i INPUT_DIR] [-o OUTPUT_DIR]
     python mkv_track_cleaner.py -l eng --audio-exclude commentary --sub-include signs
     python mkv_track_cleaner.py -l eng --audio-lang-override "English 2.0=eng"
+    python mkv_track_cleaner.py -l eng --audio-order jpn,eng --sub-order signs,full
+    python mkv_track_cleaner.py -l jap --audio-order jpn,eng,name:isolated
     python mkv_track_cleaner.py -l eng -r -i INPUT_DIR -o OUTPUT_DIR
     python mkv_track_cleaner.py -l eng -f /path/to/single_episode.mkv -o OUTPUT_DIR
 
@@ -170,6 +209,12 @@ USAGE:
     --sub-lang-override KEYWORD=LANG
                           Treat subtitle tracks matching KEYWORD as language
                           LANG, overriding their metadata (repeatable).
+    --audio-order ITEMS   Reorder kept audio tracks in the output. Ordered,
+                          comma-separated list (repeatable) of languages
+                          and/or name keywords, e.g. "jpn,eng" or
+                          "eng,name:isolated". Unmatched tracks go last.
+    --sub-order ITEMS     Same as --audio-order, for kept subtitle tracks,
+                          e.g. "signs,full".
     --include-commentary  Do NOT auto-exclude commentary tracks (excluded
                           by default; see the include/exclude section above).
     --no-color            Disable colored output (also auto-disabled when
@@ -427,6 +472,21 @@ def parse_args():
              "(eng/en/english, jpn/jp/ja/japanese, chi/zho/zh/cn/chinese, or "
              "ger/deu/de/german), overriding its (possibly wrong) language metadata. "
              "Repeatable, e.g. --sub-lang-override 'Full Subtitles=eng'"
+    )
+    parser.add_argument(
+        "--audio-order", action="append", default=None, metavar="ITEMS",
+        help="Reorder the kept audio tracks in the output. Ordered, comma-separated list "
+             "(repeatable) of languages (eng/jpn/chi/ger and their aliases) and/or track-name "
+             "keywords, e.g. --audio-order jpn,eng or --audio-order eng,name:isolated. Prefix "
+             "an item with 'name:' or 'lang:' to force keyword or language matching. Kept "
+             "tracks that match no item are placed last, in source order. Does not change "
+             "which tracks are kept, but the default track is picked using the new "
+             "order (first remaining track in the -l language, in the requested order)."
+    )
+    parser.add_argument(
+        "--sub-order", action="append", default=None, metavar="ITEMS",
+        help="Reorder the kept subtitle tracks in the output; same syntax as --audio-order, "
+             "e.g. --sub-order signs,full."
     )
     parser.add_argument(
         "--include-commentary", action="store_true",
@@ -830,7 +890,7 @@ def decide_tracks(tracks: list, language: str,
                    audio_include=None, audio_exclude=None,
                    sub_include=None, sub_exclude=None,
                    audio_lang_override=None, sub_lang_override=None,
-                   no_default_subs=False):
+                   no_default_subs=False, audio_order=None, sub_order=None):
     """
     Given the list of track dicts from mkvmerge -J, decide:
       - which audio track ids to keep
@@ -887,6 +947,11 @@ def decide_tracks(tracks: list, language: str,
             else:
                 extra_audio.append(t)
 
+    # Apply --audio-order *before* default selection, so "first remaining
+    # track" below means first in the requested order, not source order.
+    eng_audio = apply_track_order(eng_audio, audio_order, audio_lang_override)
+    secondary_audio = apply_track_order(secondary_audio, audio_order, audio_lang_override)
+
     keep_audio = eng_audio + secondary_audio + extra_audio
 
     default_ids = set()
@@ -924,6 +989,10 @@ def decide_tracks(tracks: list, language: str,
                 removal_reasons[t["id"]] = "excluded by --sub-exclude"
             else:
                 extra_subs.append(t)
+
+    # Apply --sub-order before default selection so the "first" signs /
+    # non-signs candidate below is the first in the requested order.
+    eng_subs = apply_track_order(eng_subs, sub_order, sub_lang_override)
 
     # Keep source track order across the English and opted-in tracks.
     kept_sub_ids = {t["id"] for t in eng_subs} | {t["id"] for t in extra_subs}
@@ -990,6 +1059,96 @@ def final_default_sub_id(keep_subs, default_ids, no_default_ids):
     return None
 
 
+def parse_order_spec(values) -> list:
+    """
+    Parse --audio-order / --sub-order values into an ordered list of
+    (kind, value) items, where kind is 'lang' (value is 'eng'/'jpn'/'chi'/
+    'ger') or 'name' (value is a lowercase name keyword).
+
+    Each value may be comma-separated, and the flag may be repeated. An
+    item with a "lang:" or "name:" prefix is forced to that kind; otherwise
+    it is a language if it's a known language alias, else a name keyword.
+
+    Raises ValueError with a human-readable message on malformed input.
+    """
+    items = []
+    if not values:
+        return items
+    for value in values:
+        for part in value.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            lowered = part.lower()
+            if lowered.startswith("lang:"):
+                raw = lowered[5:].strip()
+                lang = _LANG_ALIASES.get(raw)
+                if lang is None:
+                    raise ValueError(
+                        f"invalid order item '{part}': '{raw}' is not a known language "
+                        f"(use eng, jpn, chi, or ger, or an alias)"
+                    )
+                items.append(("lang", lang))
+            elif lowered.startswith("name:"):
+                kw = lowered[5:].strip()
+                if not kw:
+                    raise ValueError(f"invalid order item '{part}': keyword is empty")
+                items.append(("name", kw))
+            elif lowered in _LANG_ALIASES:
+                items.append(("lang", _LANG_ALIASES[lowered]))
+            else:
+                items.append(("name", lowered))
+    return items
+
+
+def order_item_matches(track: dict, kind: str, value: str, lang_overrides: list) -> bool:
+    """True if one parsed --audio-order/--sub-order item matches a track."""
+    if kind == "lang":
+        return resolve_track_lang(track, lang_overrides)[0] == value
+    return value in track_name(track).lower()
+
+
+def find_unmatched_order_items(kept: list, all_tracks: list, order_items: list, lang_overrides: list) -> list:
+    """
+    Return the order items that match none of the kept tracks, as a list of
+    (kind, value, matches_removed_track) tuples. matches_removed_track is
+    True if the item does match a track of that type that was removed by
+    the keep/exclude rules (useful hint: e.g. the item names a commentary
+    track that is excluded by default).
+    """
+    unmatched = []
+    for kind, value in order_items:
+        if any(order_item_matches(t, kind, value, lang_overrides) for t in kept):
+            continue
+        kept_ids = {t["id"] for t in kept}
+        removed_hit = any(order_item_matches(t, kind, value, lang_overrides)
+                          for t in all_tracks if t["id"] not in kept_ids)
+        unmatched.append((kind, value, removed_hit))
+    return unmatched
+
+
+def apply_track_order(tracks: list, order_items: list, lang_overrides: list) -> list:
+    """
+    Return `tracks` reordered according to `order_items` (see
+    parse_order_spec). Items are processed in order; each one pulls out all
+    not-yet-placed tracks it matches (keeping their relative source order).
+    Anything left over is appended afterwards in its original order, so no
+    track is ever lost. With no order items, returns the list unchanged.
+    """
+    if not order_items:
+        return list(tracks)
+    remaining = list(tracks)
+    ordered = []
+    for kind, value in order_items:
+        matched = []
+        for t in remaining:
+            if order_item_matches(t, kind, value, lang_overrides):
+                matched.append(t)
+        ordered.extend(matched)
+        remaining = [t for t in remaining if t not in matched]
+    return ordered + remaining
+
+
 def build_track_layout_signature(keep_audio, keep_subs, default_ids, forced_sub_id, forced_mode,
                                   audio_lang_override, sub_lang_override):
     """
@@ -1045,7 +1204,8 @@ def format_track_layout(sig) -> str:
 
 def build_command(mkv_path: Path, out_path: Path, keep_audio, keep_subs,
                    default_ids, no_default_ids, forced_sub_id=None, forced_mode=None,
-                   lang_corrections=None, stop_after_video_ends=False, attachment_args=None):
+                   lang_corrections=None, stop_after_video_ends=False, attachment_args=None,
+                   track_order=None):
     audio_ids = [t["id"] for t in keep_audio]
     sub_ids = [t["id"] for t in keep_subs]
     lang_corrections = lang_corrections or {}
@@ -1079,6 +1239,10 @@ def build_command(mkv_path: Path, out_path: Path, keep_audio, keep_subs,
     for t in keep_subs:
         final_forced = resolve_final_forced(t, forced_sub_id, forced_mode)
         cmd += ["--forced-display-flag", f"{t['id']}:{'yes' if final_forced else 'no'}"]
+
+    if track_order:
+        # Single input file, so the file id is always 0.
+        cmd += ["--track-order", ",".join(f"0:{tid}" for tid in track_order)]
 
     cmd.append(str(mkv_path))
     return cmd
@@ -1121,7 +1285,8 @@ def process_file(mkv_path: Path, rel_path: Path, output_dir: Path, language: str
                   audio_include=None, audio_exclude=None,
                   sub_include=None, sub_exclude=None,
                   audio_lang_override=None, sub_lang_override=None,
-                  stop_after_video_ends: bool = False, remove_images: bool = False):
+                  stop_after_video_ends: bool = False, remove_images: bool = False,
+                  audio_order=None, sub_order=None):
     audio_lang_override = audio_lang_override or []
     sub_lang_override = sub_lang_override or []
 
@@ -1143,8 +1308,27 @@ def process_file(mkv_path: Path, rel_path: Path, output_dir: Path, language: str
         sub_include=sub_include, sub_exclude=sub_exclude,
         audio_lang_override=audio_lang_override, sub_lang_override=sub_lang_override,
         no_default_subs=no_default_subs,
+        audio_order=audio_order, sub_order=sub_order,
     )
     forced_sub_id = final_default_sub_id(keep_subs, default_ids, no_default_ids)
+
+    # Final output ordering of the kept tracks. decide_tracks() already used
+    # the same order to pick defaults; this arranges the full kept lists
+    # (including opted-in extras) for the output and the dry-run display.
+    reordering = bool(audio_order or sub_order)
+    keep_audio = apply_track_order(keep_audio, audio_order, audio_lang_override)
+    keep_subs = apply_track_order(keep_subs, sub_order, sub_lang_override)
+
+    for flag, kept, all_of_type, items, overrides in (
+        ("--audio-order", keep_audio, all_audio, audio_order, audio_lang_override),
+        ("--sub-order", keep_subs, all_subs, sub_order, sub_lang_override),
+    ):
+        for kind, value, removed_hit in find_unmatched_order_items(kept, all_of_type, items or [], overrides):
+            shown = f"language '{value}'" if kind == "lang" else f'name keyword "{value}"'
+            detail = ("it only matches a track that was removed by the keep/exclude rules"
+                      if removed_hit else "no track matches it")
+            print(c_warn(f"  WARNING: {flag} item {shown} matched no kept track in "
+                         f"{rel_path.as_posix()} ({detail}); ignoring it"))
 
     if not keep_audio:
         _, secondary_desc = SECONDARY_AUDIO_LANG[language]
@@ -1174,11 +1358,19 @@ def process_file(mkv_path: Path, rel_path: Path, output_dir: Path, language: str
 
     attachment_args = attachment_command_args(all_attachments, remove_images)
 
+    track_order = None
+    if reordering:
+        # Video (and any other non-audio/sub tracks, e.g. buttons) first in
+        # source order, then audio, then subtitles in the requested order.
+        other_ids = [t["id"] for t in tracks if t["type"] not in ("audio", "subtitles")]
+        track_order = other_ids + [t["id"] for t in keep_audio] + [t["id"] for t in keep_subs]
+
     cmd = build_command(mkv_path, out_path, keep_audio, keep_subs, default_ids, no_default_ids,
                          forced_sub_id=forced_sub_id, forced_mode=forced_mode,
                          lang_corrections=lang_corrections,
                          stop_after_video_ends=stop_after_video_ends,
-                         attachment_args=attachment_args)
+                         attachment_args=attachment_args,
+                         track_order=track_order)
 
     layout_sig = build_track_layout_signature(
         keep_audio, keep_subs, default_ids, forced_sub_id, forced_mode,
@@ -1209,6 +1401,17 @@ def process_file(mkv_path: Path, rel_path: Path, output_dir: Path, language: str
                                    effective_lang=effective_lang, override_from=override_from)
             status_disp = c_keep(status) if status == "KEEP" else c_remove(status)
             print(f"  {status_disp}{line}")
+
+        if reordering:
+            print(c_header("  [DRY RUN] Output track order:"))
+            for label, group in (("audio", keep_audio), ("subs ", keep_subs)):
+                for pos, t in enumerate(group, 1):
+                    name = track_name(t)
+                    lang = (resolve_track_lang(
+                        t, audio_lang_override if t["type"] == "audio" else sub_lang_override)[0]
+                        or get_lang(t))
+                    disp = f'"{name}"' if name else "(no name)"
+                    print(f"    {label} #{pos}: [id {t['id']}] {lang} {disp}")
 
         if all_attachments and remove_images:
             print(c_header("  [DRY RUN] Attachments:"))
@@ -1421,6 +1624,13 @@ def main():
         print(c_err(f"ERROR: {e}"), file=sys.stderr)
         sys.exit(1)
 
+    try:
+        audio_order = parse_order_spec(args.audio_order)
+        sub_order = parse_order_spec(args.sub_order)
+    except ValueError as e:
+        print(c_err(f"ERROR: {e}"), file=sys.stderr)
+        sys.exit(1)
+
     if not args.dry_run:
         output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1453,7 +1663,8 @@ def main():
     if args.dry_run:
         print(c_banner("=== DRY RUN: no files will be modified or written ===") + "\n")
 
-    if audio_include or audio_exclude or sub_include or sub_exclude or audio_lang_override or sub_lang_override:
+    if (audio_include or audio_exclude or sub_include or sub_exclude
+            or audio_lang_override or sub_lang_override or audio_order or sub_order):
         print(c_header("Active filters:"))
         if audio_include:
             print(f"  --audio-include: {', '.join(audio_include)}")
@@ -1467,6 +1678,10 @@ def main():
             print(f"  --audio-lang-override: {', '.join(f'{kw}={lang}' for kw, lang in audio_lang_override)}")
         if sub_lang_override:
             print(f"  --sub-lang-override:   {', '.join(f'{kw}={lang}' for kw, lang in sub_lang_override)}")
+        if audio_order:
+            print(f"  --audio-order:   {', '.join(f'{k}:{v}' for k, v in audio_order)}")
+        if sub_order:
+            print(f"  --sub-order:     {', '.join(f'{k}:{v}' for k, v in sub_order)}")
         print()
 
     if input_dir == output_dir:
@@ -1491,6 +1706,7 @@ def main():
                 audio_lang_override=audio_lang_override, sub_lang_override=sub_lang_override,
                 stop_after_video_ends=args.stop_after_video_ends,
                 remove_images=args.remove_images,
+                audio_order=audio_order, sub_order=sub_order,
             )
             if args.dry_run:
                 layouts.append((display_name, layout_sig))
