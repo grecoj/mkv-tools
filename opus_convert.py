@@ -262,6 +262,9 @@ def plan_audio_tracks(
         reason: human-readable explanation
         bitrate: target bitrate string, or None if copying
         layout: target channel layout for the aformat filter, or None
+        sample_rate: source sample rate in Hz (0 if unknown); Opus always
+                     runs at 48 kHz, so ffmpeg resamples converted tracks
+                     that differ
         warning: (optional) set on 'convert' entries that carry a known
                  playback-compatibility risk (3- and 4-channel Opus)
 
@@ -292,6 +295,10 @@ def plan_audio_tracks(
         tags = s.get("tags", {})
         language = tags.get("language", "und")
         title = tags.get("title", "")
+        try:
+            sample_rate = int(s.get("sample_rate", 0))
+        except (TypeError, ValueError):
+            sample_rate = 0
 
         entry = {
             "audio_index": audio_idx,
@@ -300,6 +307,7 @@ def plan_audio_tracks(
             "channels": channels,
             "language": language,
             "title": title,
+            "sample_rate": sample_rate,
         }
 
         if not is_lossless_source(codec, profile):
@@ -468,6 +476,9 @@ def print_plan(fname: str, plan: list, dry_run: bool, force_rename: bool = False
             print(c(f"  {tag} -> Opus @ {e['bitrate']} | title: \"{new_title}\"", C.GREEN))
             if e.get("warning"):
                 print(c(f"    ! WARNING: {e['warning']}", C.YELLOW))
+            sr = e.get("sample_rate", 0)
+            if sr and sr != 48000:
+                print(c(f"    note: source is {sr / 1000:g} kHz -> will be resampled to 48 kHz (Opus runs at 48 kHz)", C.CYAN))
         else:
             print(c(f"  {tag} -> COPY ({e['reason']})", C.YELLOW))
 
