@@ -4,12 +4,15 @@ Commands:
   check-fonts  find ASS/SSA fonts that are neither attached nor installed
   dump-fonts   extract every unique attached font from a folder of mkvs
   add-fonts    attach fonts from the fonts folder that the subs use but the mkv lacks
+  list-fonts   list the fonts attached to each mkv (optionally filtered by name)
+  delete-fonts delete attached fonts from mkvs by file name (supports --dry-run)
 
 Requires fontTools (pip install fonttools).
 """
 
 from __future__ import annotations
 import argparse
+import fnmatch
 import hashlib
 import json
 import re
@@ -827,6 +830,148 @@ def cmd_add_fonts(args: argparse.Namespace) -> None:
             print(f"  - {f}")
 
 
+def name_matches(file_name: str, pattern: str) -> bool:
+    """Case-insensitive match of an attachment file name against a --name pattern.
+
+    A pattern with * ? or [ is a glob on the whole file name; a plain one matches the exact
+    file name or the name without its extension.
+    """
+    fn, pat = file_name.lower(), pattern.lower()
+    if any(ch in pat for ch in "*?["):
+        return fnmatch.fnmatchcase(fn, pat)
+    return fn == pat or Path(fn).stem == pat
+
+
+def cmd_delete_fonts(args: argparse.Namespace) -> None:
+    r"""Delete attached fonts from mkvs, selected by attachment file name.
+
+    Each --name is matched case-insensitively against the file names of the fonts attached
+    to every mkv in the folder. A plain name matches the exact file name or the name without
+    its extension ('Foo' or 'Foo.ttf'); use wildcards for anything broader ('Foo*', '*bold*').
+    Only font attachments are considered. By default this edits the mkv files IN PLACE with
+    mkvpropedit (fast, no remux); use -o to write edited copies to another folder instead, or
+    --dry-run to only list what would be deleted.
+    """
+    check_tools()
+    if not shutil.which("mkvpropedit"):
+        print(c("mkvpropedit not found (it ships with MKVToolNix).", C.YELLOW))
+        return
+
+    patterns = [p.strip() for p in (args.name or []) if p.strip()]
+    if not patterns:
+        print(c("Give at least one --name to delete.", C.YELLOW))
+        return
+    input_dir = Path(args.input_dir).resolve()
+    out_dir = Path(args.output_dir).resolve() if getattr(args, "output_dir", None) else None
+    if out_dir and out_dir == input_dir:
+        print(c("--output-dir must differ from the input folder (omit it to edit the mkvs in place).", C.YELLOW))
+        return
+    dry = getattr(args, "dry_run", False)
+
+    mkvs = find_mkvs(input_dir)
+    mode = ("dry run, nothing will be changed" if dry
+            else f"edited copies go to {out_dir}" if out_dir
+            else "editing the mkv files in place")
+    print(f"Found {len(mkvs)} mkv file(s) in {input_dir} ({mode})")
+    print(f"Deleting font attachments named: {', '.join(patterns)}\n")
+    if out_dir and not dry:
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+    unmatched = set(patterns)
+    mkvs_changed = files_total = failures = 0
+    for mkv in mkvs:
+        print(f"Checking {mkv.name} ...")
+        info = probe(mkv)
+        hits: List[dict] = []
+        for att in font_attachments(info):
+            matched = [pat for pat in patterns if name_matches(att.get("file_name", ""), pat)]
+            if matched:
+                hits.append(att)
+                unmatched -= set(matched)
+        if not hits:
+            print("  no matching font attachments.\n")
+            continue
+
+        verb = "would delete" if dry else "deleting"
+        print(f"  {verb} {len(hits)} font attachment(s):")
+        for att in hits:
+            detail = f"(id {att.get('id', '?')}, {att.get('size', 0) / 1024:.0f} KB)"
+            print(f"      {c('-', C.BOLD, C.YELLOW)} {att.get('file_name', '?')}  {c(detail, C.DIM)}")
+        files_total += len(hits)
+        mkvs_changed += 1
+        if dry:
+            print()
+            continue
+
+        target = mkv
+        if out_dir:
+            target = out_dir / mkv.name
+            shutil.copy2(mkv, target)
+
+        before = len(font_attachments(info))
+        # One call: mkvpropedit resolves every id against the original attachment list.
+        cmd = ["mkvpropedit", str(target)]
+        for att in hits:
+            cmd += ["--delete-attachment", str(att["id"])]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        ok = r.returncode < 2
+        if not ok:
+            print(c(f"  mkvpropedit failed: {(r.stdout + r.stderr).strip()}", C.YELLOW))
+        after = len(font_attachments(probe(target))) if ok else before
+        if ok and after <= before - len(hits):
+            print(f"  deleted {len(hits)} font file(s) ({after} fonts now attached).\n")
+        else:
+            failures += 1
+            mkvs_changed -= 1
+            files_total -= len(hits)
+            if out_dir and target != mkv:
+                target.unlink(missing_ok=True)
+            print(c("  could not confirm the fonts were deleted; "
+                    + ("the copy was removed." if out_dir else "check the mkv.") + "\n", C.YELLOW))
+
+    if unmatched:
+        print(c("No font attachment matched: " + ", ".join(sorted(unmatched, key=str.lower)), C.YELLOW))
+    verb = "Dry run: would delete" if dry else "Done. Deleted"
+    print(f"{verb} {files_total} font file(s) from {mkvs_changed} mkv file(s)."
+          + (f" {failures} mkv file(s) failed." if failures else ""))
+
+
+def cmd_list_fonts(args: argparse.Namespace) -> None:
+    r"""List the font files attached to each mkv.
+
+    Read-only. Shows each font attachment's id, file name and size, per mkv. Use -n/--name
+    to show only matching attachments (same matching as delete-fonts: case-insensitive, a
+    plain name matches the exact file name or the name without its extension, wildcards
+    like 'Foo*' or '*bold*' allowed), which previews what delete-fonts would select.
+    """
+    check_tools()
+    patterns = [p.strip() for p in (getattr(args, "name", None) or []) if p.strip()]
+    input_dir = Path(args.input_dir).resolve()
+    mkvs = find_mkvs(input_dir)
+    print(f"Found {len(mkvs)} mkv file(s) in {input_dir}"
+          + (f" (showing fonts named: {', '.join(patterns)})" if patterns else "") + "\n")
+
+    mkvs_shown = fonts_shown = 0
+    for mkv in mkvs:
+        atts = font_attachments(probe(mkv))
+        total = len(atts)
+        if patterns:
+            atts = [a for a in atts if any(name_matches(a.get("file_name", ""), pat) for pat in patterns)]
+            if not atts:
+                continue
+        label = f"{len(atts)} of {total}" if patterns else str(total)
+        print(f"{mkv.name}: {label} font attachment(s)")
+        for att in sorted(atts, key=lambda a: a.get("file_name", "").lower()):
+            detail = f"(id {att.get('id', '?')}, {att.get('size', 0) / 1024:.0f} KB)"
+            print(f"    {att.get('file_name', '?')}  {c(detail, C.DIM)}")
+        print()
+        mkvs_shown += 1
+        fonts_shown += len(atts)
+
+    print(f"{fonts_shown} font attachment(s) across {mkvs_shown} mkv file(s)"
+          + (" matched." if patterns else "."))
+
+
 def register(sub) -> None:
     p = add_stage(sub, "check-fonts",
                   "Check each mkv's ASS/SSA subtitle tracks for fonts that are neither attached nor installed.",
@@ -856,3 +1001,25 @@ def register(sub) -> None:
                         "originals in place.")
     p.add_argument("--dry-run", action="store_true",
                    help="Only show which fonts would be attached; change nothing.")
+
+    p = add_stage(sub, "delete-fonts",
+                  "Delete attached fonts from mkvs by file name (use --dry-run to preview).",
+                  cmd_delete_fonts)
+    add_input_dir(p, ".mkv files")
+    p.add_argument("-n", "--name", action="append", required=True, metavar="NAME",
+                   help="Attachment file name to delete, case-insensitive ('Foo.ttf' or 'Foo'; "
+                        "wildcards like 'Foo*' or '*bold*' allowed). Repeat for several.")
+    p.add_argument("-o", "--output-dir", default=None, metavar="DIR",
+                   help="Write edited copies of the mkvs here instead of editing the "
+                        "originals in place.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Only show which fonts would be deleted; change nothing.")
+
+    p = add_stage(sub, "list-fonts",
+                  "List the fonts attached to each mkv (optionally only those matching a name).",
+                  cmd_list_fonts)
+    add_input_dir(p, ".mkv files")
+    p.add_argument("-n", "--name", action="append", default=None, metavar="NAME",
+                   help="Only show attachments matching this file name, case-insensitive "
+                        "('Foo.ttf' or 'Foo'; wildcards like 'Foo*' or '*bold*' allowed). "
+                        "Repeat for several.")
