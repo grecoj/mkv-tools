@@ -472,36 +472,40 @@ def font_faces(path: Path) -> List[dict]:
     return faces
 
 
-def face_support(path: Path, idx: int, chars: Set[str], objs: dict) -> Tuple[Set[str], Dict[str, float]]:
+def face_support(path: Path, idx: int, chars: Set[str], objs: dict) -> Optional[Tuple[Set[str], Dict[str, float]]]:
     """Check a font face against the characters a sub renders with it.
 
-    Returns (characters the font lacks, {character: advance width in em}).
-    `objs` caches opened fonts across calls.
+    Returns (characters the font lacks, {character: advance width in em}), or None if
+    fontTools can't read the font's tables (e.g. a malformed cmap that FreeType/libass
+    would still tolerate). `objs` caches opened fonts across calls.
     """
-    key = (str(path), idx)
-    if key not in objs:
-        if path.suffix.lower() in (".ttc", ".otc"):
-            objs[key] = TTCollection(str(path), lazy=True).fonts[idx]
-        else:
-            objs[key] = TTFont(str(path), lazy=True)
-    f = objs[key]
-    cmap = f.getBestCmap() or {}
-    symmap = {}
-    if "cmap" in f:
-        sym = f["cmap"].getcmap(3, 0)   # symbol-encoded fonts map ASCII to U+F0xx
-        if sym:
-            symmap = sym.cmap
-    hmtx, upem = f["hmtx"], f["head"].unitsPerEm
-    missing: Set[str] = set()
-    widths: Dict[str, float] = {}
-    for ch in chars:
-        cp = ord(ch)
-        glyph = cmap.get(cp) or symmap.get(0xF000 + cp) or symmap.get(cp)
-        if glyph is None:
-            missing.add(ch)
-        else:
-            widths[ch] = hmtx[glyph][0] / upem
-    return missing, widths
+    try:
+        key = (str(path), idx)
+        if key not in objs:
+            if path.suffix.lower() in (".ttc", ".otc"):
+                objs[key] = TTCollection(str(path), lazy=True).fonts[idx]
+            else:
+                objs[key] = TTFont(str(path), lazy=True)
+        f = objs[key]
+        cmap = f.getBestCmap() or {}
+        symmap = {}
+        if "cmap" in f:
+            sym = f["cmap"].getcmap(3, 0)   # symbol-encoded fonts map ASCII to U+F0xx
+            if sym:
+                symmap = sym.cmap
+        hmtx, upem = f["hmtx"], f["head"].unitsPerEm
+        missing: Set[str] = set()
+        widths: Dict[str, float] = {}
+        for ch in chars:
+            cp = ord(ch)
+            glyph = cmap.get(cp) or symmap.get(0xF000 + cp) or symmap.get(cp)
+            if glyph is None:
+                missing.add(ch)
+            else:
+                widths[ch] = hmtx[glyph][0] / upem
+        return missing, widths
+    except Exception:
+        return None
 
 
 def pick_font_files(font: str, rels: List[str], index: Dict[str, dict], fonts_dir: Path,
@@ -549,12 +553,20 @@ def pick_font_files(font: str, rels: List[str], index: Dict[str, dict], fonts_di
     for cands in groups.values():
         ordered = sorted(cands, key=rank)
         support = {rel: face_support(fonts_dir / rel, cands[rel], chars, objs) for rel in ordered} if chars else {}
-        excluded = [(rel, len(support[rel][0])) for rel in ordered if chars and support[rel][0]]
-        good = [rel for rel in ordered if not (chars and support[rel][0])]
-        pick = {"n": len(ordered), "n_chars": len(chars), "excluded": excluded, "differ": [], "missing_n": 0}
+        unreadable = [rel for rel in ordered if chars and support[rel] is None]
+        readable = [rel for rel in ordered if rel not in unreadable]
+        excluded = [(rel, len(support[rel][0])) for rel in readable if chars and support[rel][0]]
+        good = [rel for rel in readable if not (chars and support[rel][0])]
+        pick = {"n": len(ordered), "n_chars": len(chars), "excluded": excluded, "differ": [], "missing_n": 0,
+                "unreadable": unreadable}
+
+        if not good and unreadable:   # nothing verifiable covers the subs; fontTools can't read some files
+            pick.update(rel=unreadable[0], status="unreadable", excluded=[])
+            picks.append(pick)
+            continue
 
         if not good:   # every candidate lacks some of the characters used: take the closest
-            best = min(ordered, key=lambda r: (len(support[r][0]), ordered.index(r)))
+            best = min(readable, key=lambda r: (len(support[r][0]), readable.index(r)))
             pick.update(rel=best, status="uncovered", excluded=[], missing_n=len(support[best][0]))
             picks.append(pick)
             continue
@@ -597,8 +609,14 @@ def describe_pick(font: str, p: dict) -> Tuple[str, Optional[str], List[str]]:
     elif status == "uncovered":
         parts.append(f"CHECK: lacks {p['missing_n']} of {p['n_chars']} characters used")
         reason = f"no candidate has all {p['n_chars']} characters used (best, {p['rel']}, lacks {p['missing_n']})"
+    elif status == "unreadable":
+        parts.append("CHECK: font tables couldn't be parsed, so glyph coverage wasn't verified")
+        reason = f"{p['rel']}: font tables couldn't be parsed (coverage unverified)"
     elif status == "unchecked" and p["n"] > 1:
         parts.append("no subtitle text uses this font, so it wasn't verified")
+    if p.get("unreadable") and status != "unreadable":
+        parts.append(f"{len(p['unreadable'])} unreadable file(s) skipped")
+        extra += [f"unreadable: {rel}" for rel in p["unreadable"]]
     if p["excluded"]:
         parts.append(f"{len(p['excluded'])} excluded for missing glyphs")
         extra += [f"excluded: {rel} (lacks {k} of {p['n_chars']} characters used)" for rel, k in p["excluded"]]
